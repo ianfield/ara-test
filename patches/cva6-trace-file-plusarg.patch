@@ -1,0 +1,11 @@
+--- a/cva6/core/cva6.sv
++++ b/cva6/core/cva6.sv
+@@ -1810,7 +1810,8 @@
+
+   initial begin
+     string fn;
+-    $sformat(fn, "trace_hart_%0.0f.dasm", hart_id_i);
++    if (!$value$plusargs("trace_file=%s", fn))
++      $sformat(fn, "trace_hart_%0.0f.dasm", hart_id_i);
+     f = $fopen(fn, "w");
+   end
