@@ -306,6 +306,67 @@ def test_vmsbf_hazard(sim):
     assert vmseq_mask == 0b0100, f"vmseq after vmsbf: expected 0b0100, got 0b{vmseq_mask:04b}"
 
 
+def test_fpcmp_latency_overtake(sim):
+    """vmfge.vf (LatFNonComp=1) must not overtake vfmul.vf (LatFCompEW32=4).
+
+    fpu_latency() was missing [VMFEQ:VMFGE] from the LatFNonComp case.
+    Comparisons fell to default → LatFCompEW32=4, same as multiply.
+    latency_stall saw (4 < 4) = false and let the comparison issue
+    behind the multiply without stall.
+
+    Trigger: filler vfmul (lat=4) occupies the VMFPU pipeline so that
+    vmfge (lat=1) and its operands queue behind it.  vmfge's 1-cycle
+    result exits fpnew first, gets attributed to the filler's
+    processing slot, and corrupts the mask register (v0).  A masked
+    vfadd then consumes the wrong mask, producing incorrect results.
+    """
+    va       = [1.0, 2.0, 3.0, 4.0]
+    vb       = [-10.0, 20.0, -30.0, 40.0]
+    expected = [1.0, 40.0, 3.0, 80.0]   # mask [0,1,0,1] → double vb where >= 0
+    N = len(va)
+    off_va   = 0x104000
+    off_vb   = 0x106000
+    off_dst  = 0x108000
+
+    binary = compile_snippet(f'''
+    int main() {{
+        asm volatile(
+            "vsetivli zero, {N}, e32, m1, ta, mu\\n"
+            "li a1, 0x80104000\\n"
+            "li a2, 0x80106000\\n"
+            "li a3, 0x80108000\\n"
+            "fmv.w.x fa5, x0\\n"
+
+            "vle32.v v4, (a1)\\n"
+            "vle32.v v6, (a2)\\n"
+
+            // filler vfadd.vv (lat 4) — 2 vector operands keep VMFPU busy
+            "vfadd.vv v24, v24, v26\\n"
+            // vmfge (lat 1) — overtakes filler, corrupts mask v0
+            "vmfge.vf v0, v6, fa5\\n"
+            // masked vfadd — consumes v0; wrong mask → wrong result
+            "vfadd.vv v4, v6, v6, v0.t\\n"
+
+            "vse32.v v4, (a3)\\n"
+            ::: "a1", "a2", "a3", "fa5", "memory");
+        return 0;
+    }}
+    ''')
+
+    sim.load(binary)
+    sim.load(struct.pack(f'<{N}f', *va), sram_offset=off_va)
+    sim.load(struct.pack(f'<{N}f', *vb), sram_offset=off_vb)
+    sim.boot()
+    result = sim.run(max_cycles=50000)
+    assert_ok(result)
+
+    raw = sim.peek_u32(off_dst, N)
+    got = [struct.unpack('<f', struct.pack('<I', raw[i]))[0] for i in range(N)]
+    for i in range(N):
+        assert got[i] == expected[i], (
+            f"[{i}] expected {expected[i]}, got {got[i]} (0x{raw[i]:08x})")
+
+
 def test_vcpop_hazard(sim):
     """vcpop → vmseq. Exercises vcpop (mask-to-scalar) through mask unit."""
     # Build v0 = 0b1010 via comparisons, then vcpop should return 2.
